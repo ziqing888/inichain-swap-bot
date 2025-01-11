@@ -1,6 +1,7 @@
 # IniChain Bot v1.0
 
 IniChain Bot 是一个用于自动执行每日签到、代币兑换、创建新代币以及管理账户余额的 Python 脚本。该机器人通过与以太坊兼容的区块链（如 INIChain）交互，实现了自动化的区块链操作，帮助用户高效管理其数字资产。
+
 注册：https://candy.inichain.com?invite=JCT01UDJV9CQRJ5RUVTDTS4MV
 
 领水： https://faucet-testnet.inichain.com/
