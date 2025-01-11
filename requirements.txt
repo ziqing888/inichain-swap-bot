@@ -1,4 +1,4 @@
-web3==6.6.1
-eth-account==0.9.0
-python-dotenv==1.0.0
-pytz==2023.10
+web3
+eth-account
+python-dotenv
+pytz
