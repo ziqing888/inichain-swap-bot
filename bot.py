@@ -166,10 +166,10 @@ TOKEN_FACTORY_ABI = [
     }
 ]
 
-
+# Token Factory 合约地址
 TOKEN_FACTORY_CONTRACT = "0x01AA0e004F7e7591f2fc2712384dF9B5FDB759DD"
 
-
+# 初始化 Web3
 w3 = Web3(Web3.HTTPProvider(RPC_URL))
 
 class IniChainBot:
@@ -180,7 +180,7 @@ class IniChainBot:
         self.checkin_contract = w3.eth.contract(address=DAILY_CHECKIN_CONTRACT, abi=DAILY_CHECKIN_ABI)
         self.wini_contract = w3.eth.contract(address=WINI_CONTRACT, abi=WINI_ABI)
         self.last_checkin = {}
-        
+
     def get_dynamic_gas_price(self, priority="normal"):
         """根据当前网络状况获取动态Gas价格"""
         base_gas_price = w3.eth.gas_price
@@ -193,7 +193,7 @@ class IniChainBot:
         
         gas_price = int(base_gas_price * multipliers[priority])
         
-    
+        # 安全上限 (最大5 Gwei)
         max_gas_price = 5 * 10**9
         return min(gas_price, max_gas_price)
 
@@ -238,7 +238,7 @@ class IniChainBot:
                     'from': self.address,
                     'to': DAILY_CHECKIN_CONTRACT,
                     'value': 0,
-                    'data': '0x183ff085', 
+                    'data': '0x183ff085',  # Checkin函数签名
                     'gasPrice': gas_price,
                     'nonce': nonce
                 })
@@ -250,8 +250,8 @@ class IniChainBot:
                     return False
                 else:
                     print(f"[{account_info}] 估算Gas时出错: {error_message}")
-                    gas_estimate = 150000  
-                
+                    gas_estimate = 150000  # 回退Gas限制
+            
             transaction = {
                 'from': self.address,
                 'to': DAILY_CHECKIN_CONTRACT,
@@ -260,12 +260,11 @@ class IniChainBot:
                 'gasPrice': gas_price,
                 'nonce': nonce,
                 'chainId': CHAIN_ID,
-                'data': '0x183ff085'  
+                'data': '0x183ff085'  # Checkin函数签名
             }
 
             signed_txn = w3.eth.account.sign_transaction(transaction, self.account.key)
             tx_hash = w3.eth.send_raw_transaction(signed_txn.rawTransaction)
-            
             
             receipt = self.wait_for_transaction(tx_hash)
             
@@ -277,7 +276,6 @@ class IniChainBot:
                 if receipt:
                     print(f"[{account_info}] 签到失败! Gas消耗: {receipt.get('gasUsed', '未知')}")
                     try:
-                      
                         tx = w3.eth.get_transaction(tx_hash)
                         print(f"[{account_info}] 交易详情:")
                         print(f"  Gas价格: {tx.get('gasPrice', '未知')}")
@@ -308,7 +306,7 @@ class IniChainBot:
                 receipt = w3.eth.get_transaction_receipt(tx_hash)
                 if receipt is not None:
                     return receipt
-            except Exception as e:
+            except Exception:
                 pass
             
             if time.time() - start_time > timeout:
@@ -324,21 +322,20 @@ class IniChainBot:
         
         try:
             print(f"[{account_info}] 开始批准流程...")
-            
-            # 先检查允许额度
             current_allowance = token_contract.functions.allowance(self.address, ROUTER_CONTRACT).call()
+            formatted_allowance = self.format_amount(current_allowance, USDT_DECIMALS)
+            print(f"[{account_info}] 当前允许额度: {formatted_allowance:.6f} USDT")
+
             if current_allowance >= amount:
                 print(f"[{account_info}] 允许额度已足够，无需再次批准")
                 return True
             
             nonce = w3.eth.get_transaction_count(self.address)
-            gas_price = self.get_approve_gas_price()  # 使用更高的Gas价格进行批准
+            gas_price = self.get_approve_gas_price()
             
             print(f"[{account_info}] 发送批准交易，Gas价格: {gas_price / 1e9:.2f} Gwei")
             
-         
             amount = int(amount)
-            
             approve_txn = token_contract.functions.approve(
                 ROUTER_CONTRACT,
                 amount
@@ -354,8 +351,13 @@ class IniChainBot:
             tx_hash = w3.eth.send_raw_transaction(signed_txn.rawTransaction)
             
             receipt = self.wait_for_transaction(tx_hash)
-            return receipt is not None and receipt['status'] == 1
-            
+            if receipt and receipt['status'] == 1:
+                print(f"[{account_info}] 批准成功!")
+                return True
+            else:
+                print(f"[{account_info}] 批准失败!")
+                return False
+                
         except Exception as e:
             print(f"[{account_info}] 批准时出错: {str(e)}")
             return False
@@ -366,7 +368,6 @@ class IniChainBot:
             path = [token_in, token_out]
             amount_in_wei = int(amount_in * 1e18)
             
-        
             amounts_out = self.router_contract.functions.getAmountsOut(
                 amount_in_wei,
                 path
@@ -377,40 +378,118 @@ class IniChainBot:
             print(f"[{self.address}] 获取价格时出错: {str(e)}")
             return 0
 
-    def swap_usdt_to_ini(self, amount, account_info):
-        """将USDT兑换为INI"""
+    # ========== 新增：WINI → INI 的解包函数 ==========
+    def withdraw_wini(self, wini_amount, account_info):
+        """
+        将指定数量的WINI解包为原生INI。
+        :param wini_amount: 需要解包的WINI数量（单位：最小单位，int 类型）
+        :param account_info: 用于日志打印的账户信息
+        """
         try:
-        
-            amount_in_wei = int(amount * (10 ** USDT_DECIMALS))
+            nonce = w3.eth.get_transaction_count(self.address)
+            gas_price = self.get_gas_price()
+
+            # 估算Gas
+            try:
+                gas_estimate = self.wini_contract.functions.withdraw(
+                    wini_amount
+                ).estimate_gas({
+                    'from': self.address,
+                    'gasPrice': gas_price,
+                    'nonce': nonce
+                })
+                print(f"[{account_info}] 估算 WINI → INI Gas: {gas_estimate}")
+            except Exception as e:
+                print(f"[{account_info}] 估算 WINI → INI Gas时出错: {str(e)}")
+                gas_estimate = 120000  # 回退Gas限制，可根据实际情况调整
+
+            # 构建 withdraw 交易
+            withdraw_txn = self.wini_contract.functions.withdraw(
+                wini_amount
+            ).build_transaction({
+                'from': self.address,
+                'gas': gas_estimate,
+                'gasPrice': gas_price,
+                'nonce': nonce,
+                'chainId': CHAIN_ID
+            })
+
+            # 签名并发送
+            signed_txn = w3.eth.account.sign_transaction(withdraw_txn, self.account.key)
+            tx_hash = w3.eth.send_raw_transaction(signed_txn.rawTransaction)
+
+            print(f"[{account_info}] 开始执行 WINI → INI，交易哈希: {tx_hash.hex()}")
+            receipt = self.wait_for_transaction(tx_hash)
+            if receipt and receipt['status'] == 1:
+                print(f"[{account_info}] WINI → INI 成功!")
+                return True
+            else:
+                print(f"[{account_info}] WINI → INI 失败!")
+                if receipt:
+                    print(f"[{account_info}] Gas使用量: {receipt.get('gasUsed', '未知')}")
+                return False
+
+        except Exception as e:
+            print(f"[{account_info}] WINI → INI 时出错: {str(e)}")
+            return False
+
+    # ========== 修改：swap_usdt_to_ini ==========
+    def swap_usdt_to_ini(self, amount, account_info):
+        """将USDT兑换为原生INI（通过先兑换为WINI，再withdraw）"""
+        try:
+            print(f"[{account_info}] 正在执行 swap_usdt_to_ini，金额: {amount} USDT")
             
-            if not self.approve_token(USDT_CONTRACT, amount_in_wei, account_info):
-                print(f"[{account_info}] 批准USDT失败")
-                return
-                
+            # 1) 先把 USDT -> WINI
+            amount_in_wei = int(amount * (10 ** USDT_DECIMALS))
+            print(f"[{account_info}] 转换后的金额 (wei): {amount_in_wei}")
+            
+            # 获取当前 USDT 余额
+            usdt_balance = self.get_token_balance(USDT_CONTRACT)
+            formatted_usdt_balance = self.format_amount(usdt_balance, USDT_DECIMALS)
+            print(f"[{account_info}] 当前 USDT 余额: {formatted_usdt_balance:.6f} USDT")
+            
+            if usdt_balance < amount_in_wei:
+                print(f"[{account_info}] USDT 余额不足，无法兑换")
+                return False
+            
+            # 获取当前允许额度
+            token_contract = w3.eth.contract(address=USDT_CONTRACT, abi=ERC20_ABI)
+            current_allowance = token_contract.functions.allowance(self.address, ROUTER_CONTRACT).call()
+            formatted_allowance = self.format_amount(current_allowance, USDT_DECIMALS)
+            print(f"[{account_info}] 当前允许额度: {formatted_allowance:.6f} USDT")
+            
+            # Approve
+            if current_allowance < amount_in_wei:
+                print(f"[{account_info}] 允许额度不足，正在批准...")
+                if not self.approve_token(USDT_CONTRACT, amount_in_wei, account_info):
+                    print(f"[{account_info}] 批准 USDT 失败")
+                    return False
+                else:
+                    print(f"[{account_info}] 批准 USDT 成功")
+            else:
+                print(f"[{account_info}] 允许额度足够，无需再次批准")
+            
+            # 开始 swapExactTokensForTokens
             nonce = w3.eth.get_transaction_count(self.address)
             gas_price = self.get_gas_price()
             deadline = int(time.time()) + 300  # 5分钟截止时间
             
-     
+            # 获取预期输出 (USDT->WINI)
             expected_out = self.get_token_price(USDT_CONTRACT, WINI_CONTRACT, amount)
             if expected_out == 0:
                 print(f"[{account_info}] 获取价格失败，取消兑换")
-                return
+                return False
+            print(f"[{account_info}] 预期输出: {expected_out:.6f} WINI (暂时)")
             
-            min_out = int(expected_out * 1e18 * 0.95)  
+            min_out = int(expected_out * 1e18 * 0.95)  # 5% 滑点
+            print(f"[{account_info}] 最小输出: {min_out / 1e18:.6f} WINI")
             
-            print(f"[{account_info}] 开始将USDT兑换为INI...")
-            print(f"[{account_info}] Gas价格: {gas_price / 1e9:.2f} Gwei")
-            print(f"[{account_info}] 金额: {amount:.6f} USDT")
-            print(f"[{account_info}] 预期输出: {expected_out:.6f} INI")
-            print(f"[{account_info}] 最小输出: {min_out / 1e18:.6f} INI")
-            
-          
             path = [USDT_CONTRACT, WINI_CONTRACT]
+            print(f"[{account_info}] 交易路径: {path}")
             
-           
+            # 估算 Gas
             try:
-                gas_estimate = self.router_contract.functions.swapExactTokensForETH(
+                gas_estimate = self.router_contract.functions.swapExactTokensForTokens(
                     amount_in_wei,
                     min_out,
                     path,
@@ -421,17 +500,17 @@ class IniChainBot:
                     'gasPrice': gas_price,
                     'nonce': nonce
                 })
-                print(f"[{account_info}] 估算Gas: {gas_estimate}")
+                print(f"[{account_info}] 估算 Gas: {gas_estimate}")
             except Exception as e:
-                print(f"[{account_info}] 估算Gas时出错: {str(e)}")
-                gas_estimate = 201306  # 成功交易的Gas限制
-            
-            swap_txn = self.router_contract.functions.swapExactTokensForETH(
-                amount_in_wei,  # 输入金额
-                min_out,        # 最小输出金额
-                path,           # 路径
-                self.address,   # 接收地址
-                deadline        # 截止时间
+                print(f"[{account_info}] 估算 Gas 时出错: {str(e)}")
+                gas_estimate = 300000  # 根据实际情况调整
+                
+            swap_txn = self.router_contract.functions.swapExactTokensForTokens(
+                amount_in_wei,  # amountIn
+                min_out,        # amountOutMin
+                path,           # path: USDT->WINI
+                self.address,   # to
+                deadline        # deadline
             ).build_transaction({
                 'from': self.address,
                 'gas': gas_estimate,
@@ -440,15 +519,36 @@ class IniChainBot:
                 'chainId': CHAIN_ID
             })
             
+            print(f"[{account_info}] 构建交易完成，发送交易...")
             signed_txn = w3.eth.account.sign_transaction(swap_txn, self.account.key)
             tx_hash = w3.eth.send_raw_transaction(signed_txn.rawTransaction)
+            print(f"[{account_info}] 发送交易，哈希: {tx_hash.hex()}")
             
+            # 等待交易回执
             receipt = self.wait_for_transaction(tx_hash)
-            if receipt and receipt['status'] == 1:
-                print(f"[{account_info}] USDT兑换INI成功!")
-                return True
+            if not receipt or receipt['status'] != 1:
+                print(f"[{account_info}] USDT->WINI失败!")
+                if receipt:
+                    print(f"[{account_info}] Gas使用量: {receipt.get('gasUsed', '未知')}")
+                return False
+            
+            print(f"[{account_info}] USDT->WINI 成功!")
+            # 2) WINI → INI
+            wini_balance = self.get_token_balance(WINI_CONTRACT)
+            wini_balance_ether = self.format_amount(wini_balance, INI_DECIMALS)
+            print(f"[{account_info}] 当前 WINI 余额: {wini_balance_ether:.6f} WINI")
+            
+            if wini_balance > 0:
+                print(f"[{account_info}] 正在将 WINI 解包为原生INI...")
+                result = self.withdraw_wini(wini_balance, account_info)
+                if result:
+                    print(f"[{account_info}] 兑换已完成，最终获得原生INI!")
+                    return True
+                else:
+                    print(f"[{account_info}] withdraw 失败，未拿到原生INI!")
+                    return False
             else:
-                print(f"[{account_info}] USDT兑换INI失败!")
+                print(f"[{account_info}] WINI 余额为0，不需解包")
                 return False
                 
         except Exception as e:
@@ -462,10 +562,8 @@ class IniChainBot:
             gas_price = self.get_gas_price()
             deadline = int(time.time()) + 300  # 5分钟截止时间
             
-            # 将金额转换为wei
             amount_in_wei = w3.to_wei(amount, 'ether')
             
-            # 获取预期输出金额
             expected_out = self.get_token_price(WINI_CONTRACT, USDT_CONTRACT, amount)
             if expected_out == 0:
                 print(f"[{account_info}] 获取价格失败，取消兑换")
@@ -479,16 +577,15 @@ class IniChainBot:
             print(f"[{account_info}] 预期输出: {expected_out:.6f} USDT")
             print(f"[{account_info}] 最小输出: {min_out / 1e18:.6f} USDT")
             
-            # 路径: WINI -> USDT
             path = [WINI_CONTRACT, USDT_CONTRACT]
             
             # 估算Gas限制
             try:
                 gas_estimate = self.router_contract.functions.swapExactETHForTokens(
-                    min_out,  # 最小输出金额
-                    path,     # 路径
-                    self.address,  # 接收地址
-                    deadline  # 截止时间
+                    min_out,  
+                    path,     
+                    self.address,
+                    deadline
                 ).estimate_gas({
                     'from': self.address,
                     'value': amount_in_wei,
@@ -498,25 +595,27 @@ class IniChainBot:
                 print(f"[{account_info}] 估算Gas: {gas_estimate}")
             except Exception as e:
                 print(f"[{account_info}] 估算Gas时出错: {str(e)}")
-                gas_estimate = 201306  # 成功交易的Gas限制
+                gas_estimate = 201306
             
-            # 构建交易
             swap_txn = self.router_contract.functions.swapExactETHForTokens(
-                min_out,  # 最小输出金额
-                path,     # 路径
-                self.address,  # 接收地址
-                deadline  # 截止时间
+                min_out,
+                path,
+                self.address,
+                deadline
             ).build_transaction({
                 'from': self.address,
                 'gas': gas_estimate,
                 'gasPrice': gas_price,
-                'value': amount_in_wei,  # 兑换的INI金额
+                'value': amount_in_wei,
                 'nonce': nonce,
                 'chainId': CHAIN_ID
             })
             
+            print(f"[{account_info}] 构建交易完成，发送交易...")
+            
             signed_txn = w3.eth.account.sign_transaction(swap_txn, self.account.key)
             tx_hash = w3.eth.send_raw_transaction(signed_txn.rawTransaction)
+            print(f"[{account_info}] 发送交易，哈希: {tx_hash.hex()}")
             
             receipt = self.wait_for_transaction(tx_hash)
             if receipt and receipt['status'] == 1:
@@ -524,6 +623,8 @@ class IniChainBot:
                 return True
             else:
                 print(f"[{account_info}] INI兑换USDT失败!")
+                if receipt:
+                    print(f"[{account_info}] Gas使用量: {receipt.get('gasUsed', '未知')}")
                 return False
                 
         except Exception as e:
@@ -536,13 +637,11 @@ class IniChainBot:
             nonce = w3.eth.get_transaction_count(self.address)
             gas_price = self.get_gas_price()
             
-            # 将金额转换为wei
             amount_in_wei = w3.to_wei(amount, 'ether')
             
             print(f"[{self.address}] 将 {amount:.6f} INI 包装为 WINI...")
             print(f"[{self.address}] Gas价格: {gas_price / 1e9:.2f} Gwei")
             
-            # 估算Gas
             try:
                 gas_estimate = self.wini_contract.functions.deposit().estimate_gas({
                     'from': self.address,
@@ -553,9 +652,8 @@ class IniChainBot:
                 print(f"[{self.address}] 估算Gas: {gas_estimate}")
             except Exception as e:
                 print(f"[{self.address}] 估算Gas时出错: {str(e)}")
-                gas_estimate = 50000  # 回退Gas限制用于存款
+                gas_estimate = 50000
             
-            # 构建交易
             deposit_txn = self.wini_contract.functions.deposit().build_transaction({
                 'from': self.address,
                 'gas': gas_estimate,
@@ -583,42 +681,36 @@ class IniChainBot:
     def perform_swap(self, account_info):
         """在INI和USDT之间随机执行兑换"""
         try:
-            # 先获取当前INI余额
             ini_balance = w3.eth.get_balance(self.address)
             formatted_balance = w3.from_wei(ini_balance, 'ether')
             
-            # 计算Gas费用
             gas_price = self.get_gas_price()
-            estimated_gas = 201306  # 成功交易的Gas限制
+            estimated_gas = 201306
             gas_cost = gas_price * estimated_gas
             
-            # 保留一些INI用于未来的Gas（当前Gas费用的1.2倍）
-            safe_balance = ini_balance - (gas_cost * 1.2)
+            safe_balance = ini_balance - int(gas_cost * 1.2)
+            
+            print(f"[{account_info}] 当前INI余额: {formatted_balance:.6f} INI")
+            print(f"[{account_info}] Gas费用: {w3.from_wei(gas_cost, 'ether'):.6f} INI")
+            print(f"[{account_info}] 安全余额: {w3.from_wei(safe_balance, 'ether'):.6f} INI")
             
             if safe_balance > gas_cost:
                 # 将10-25%的INI兑换为USDT
                 swap_percentage = random.uniform(0.10, 0.25)
                 amount_to_swap = float(w3.from_wei(int(safe_balance * swap_percentage), 'ether'))
                 
-                print(f"[{account_info}] 当前余额: {formatted_balance:.6f} INI")
-                print(f"[{account_info}] Gas费用: {w3.from_wei(gas_cost, 'ether'):.6f} INI")
-                print(f"[{account_info}] 安全余额: {w3.from_wei(safe_balance, 'ether'):.6f} INI")
                 print(f"[{account_info}] 将兑换: {amount_to_swap:.6f} INI ({swap_percentage*100:.1f}% 从安全余额)")
-                
                 self.swap_ini_to_usdt(amount_to_swap, account_info)
             else:
-                # 检查USDT余额
                 usdt_balance = self.get_token_balance(USDT_CONTRACT)
-                formatted_balance = self.format_amount(usdt_balance, USDT_DECIMALS)
+                formatted_usdt_balance = self.format_amount(usdt_balance, USDT_DECIMALS)
+                print(f"[{account_info}] 当前USDT余额: {formatted_usdt_balance:.6f} USDT")
                 
                 if usdt_balance > 0:
-                    # 将80-90%的USDT兑换为INI
                     swap_percentage = random.uniform(0.80, 0.90)
-                    amount_to_swap = formatted_balance * swap_percentage
+                    amount_to_swap = formatted_usdt_balance * swap_percentage
                     
-                    print(f"[{account_info}] USDT余额: {formatted_balance:.6f}")
                     print(f"[{account_info}] 将兑换: {amount_to_swap:.6f} USDT 到 INI ({swap_percentage*100:.1f}% 从余额)")
-                    
                     self.swap_usdt_to_ini(amount_to_swap, account_info)
                 else:
                     print(f"[{account_info}] INI余额不足以进行兑换")
@@ -632,12 +724,10 @@ class IniChainBot:
         """使用指定参数创建新代币"""
         try:
             token_factory = w3.eth.contract(address=TOKEN_FACTORY_CONTRACT, abi=TOKEN_FACTORY_ABI)
-            
-            # 将总供应量转换为wei格式
             total_supply_wei = int(total_supply * (10 ** decimals))
             
             nonce = w3.eth.get_transaction_count(self.address)
-            gas_price = self.get_dynamic_gas_price("normal")  # 使用动态Gas价格
+            gas_price = self.get_dynamic_gas_price("normal")
             
             print(f"[{account_info}] 开始创建代币...")
             print(f"[{account_info}] Gas价格: {gas_price / 1e9:.2f} Gwei")
@@ -646,12 +736,10 @@ class IniChainBot:
             print(f"[{account_info}] 总供应量: {total_supply_wei}")
             print(f"[{account_info}] 小数位: {decimals}")
             
-            # 使用与成功交易相同的Gas限制构建交易
-            gas_limit = 1548128  # 成功交易的Gas限制
+            gas_limit = 1548128
             estimated_gas_cost = gas_limit * gas_price / 1e18
             print(f"[{account_info}] 估算Gas费用: {estimated_gas_cost:.6f} INI")
             
-            # 检查INI余额
             balance = w3.eth.get_balance(self.address)
             formatted_balance = w3.from_wei(balance, 'ether')
             print(f"[{account_info}] 当前余额: {formatted_balance:.6f} INI")
@@ -660,10 +748,9 @@ class IniChainBot:
                 print(f"[{account_info}] INI余额不足以支付Gas费用!")
                 return False
             
-            # 使用与成功交易完全相同的输入数据
+            # 这里是你抓取到的成功交易的data，可根据实际情况更改
             input_data = "0x8ab84b4a000000000000000000000000000000000000000000000000000000000000008000000000000000000000000000000000000000000000000000000000000000c000000000000000000000000000000000000000000000000000000000000186a000000000000000000000000000000000000000000000000000000000000000120000000000000000000000000000000000000000000000000000000000000004757364740000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000047573647400000000000000000000000000000000000000000000000000000000"
-            
-            # 构建交易
+
             transaction = {
                 'from': self.address,
                 'to': TOKEN_FACTORY_CONTRACT,
@@ -674,7 +761,6 @@ class IniChainBot:
                 'data': input_data
             }
             
-            # 签名并发送交易
             signed_txn = w3.eth.account.sign_transaction(transaction, self.account.key)
             tx_hash = w3.eth.send_raw_transaction(signed_txn.rawTransaction)
             
@@ -700,18 +786,12 @@ def get_transaction_type(tx, bot_address, bot):
     if tx['to'] is None:
         return "合约创建", None
         
-    # 检查每日签到
     if tx['to'].lower() == DAILY_CHECKIN_CONTRACT.lower():
         return "每日签到", None
         
-    # 检查代币转移
     if tx['to'].lower() == ROUTER_CONTRACT.lower():
-        if tx['value'] > 0:
-            return "INI兑换USDT", f"{bot.format_amount(tx['value'], INI_DECIMALS):.6f} INI"
-        else:
-            return "USDT兑换INI", None
+        return "USDT兑换INI", None
             
-    # 默认交易
     if tx['from'].lower() == bot_address.lower():
         return "转出交易", f"{bot.format_amount(tx['value'], INI_DECIMALS):.6f} INI"
     else:
@@ -719,20 +799,15 @@ def get_transaction_type(tx, bot_address, bot):
 
 def show_status(private_key, account_num):
     """显示账户状态"""
-    # 初始化机器人
     bot = IniChainBot(private_key)
     account_info = f"账户 {account_num} | {bot.address[-4:]}"
     
-    # 获取余额
     ini_balance = w3.eth.get_balance(bot.address) / 10**18
     usdt_balance = bot.get_token_balance(USDT_CONTRACT) / 10**18
     
-    # 获取Gas价格
     gas_price = w3.eth.gas_price / 10**9
-    
-    # 估算费用
-    checkin_gas = 150000  # 签到的估算Gas
-    swap_gas = 300000     # 兑换的估算Gas
+    checkin_gas = 150000
+    swap_gas = 300000
     
     checkin_fee = (checkin_gas * gas_price) / 10**9
     swap_fee = (swap_gas * gas_price) / 10**9
@@ -747,26 +822,21 @@ def show_status(private_key, account_num):
     
     print(f"\n最近的交易历史 [{account_info}]:")
     try:
-        # 获取最近100个区块
         latest = w3.eth.block_number
         start_block = max(0, latest - 100)
         
-        # 获取交易
         for block in range(latest, start_block, -1):
             block_data = w3.eth.get_block(block, True)
-            
             for tx in block_data.transactions:
                 if tx['from'].lower() == bot.address.lower() or (tx['to'] and tx['to'].lower() == bot.address.lower()):
-                    # 获取时间戳
                     timestamp = datetime.fromtimestamp(block_data.timestamp, wib)
                     
-                    # 确定交易类型
                     tx_type = "未知"
                     if tx['to'] and tx['to'].lower() == DAILY_CHECKIN_CONTRACT.lower():
                         tx_type = "每日签到"
                     elif tx['to'] and tx['to'].lower() == ROUTER_CONTRACT.lower():
                         tx_type = "兑换"
-                        
+                    
                     print(f"区块 {block} ({timestamp:%Y-%m-%d %H:%M:%S}) - {tx_type} (Gas: {tx['gas']})")
                     print(f"  哈希: {tx['hash'].hex()}")
                     
@@ -786,7 +856,7 @@ def process_accounts(private_keys, action):
             bot.perform_swap(account_info)
         elif action == "status":
             show_status(private_key, i)
-        time.sleep(5)  # 账户之间的延迟
+        time.sleep(5)
 
 def auto_daily_and_swap(private_keys):
     """自动每日签到和兑换，循环执行"""
@@ -797,25 +867,20 @@ def auto_daily_and_swap(private_keys):
             print(f"开始第 {cycle_count} 个周期...")
             print(f"{'='*50}")
             
-            # 执行每日签到
             print("\n开始每日签到...")
             process_accounts(private_keys, "checkin")
             print("每日签到完成!")
             
-            # 等待5秒后开始兑换
             print("\n等待5秒后开始兑换...")
             time.sleep(5)
             
-            # 执行兑换
             print("\n开始兑换过程...")
             process_accounts(private_keys, "swap")
             print("兑换过程完成!")
     
-            # 等待5秒后发送INI到自身
             print("\n等待5秒后开始发送INI到自身...")
             time.sleep(5)
             
-            # 执行发送INI到自身
             print("\n开始发送INI到自身的过程...")
             send_ini_to_self(private_keys)
             print("发送INI到自身的过程完成!")
@@ -823,14 +888,13 @@ def auto_daily_and_swap(private_keys):
             print(f"\n第 {cycle_count} 个周期完成")
             print("等待10分钟后开始下一个周期...")
             
-            # 倒计时
-            for i in range(600, 0, -1):  # 600秒 = 10分钟
+            for i in range(600, 0, -1):
                 minutes = i // 60
                 seconds = i % 60
                 print(f"\r下一个周期开始的时间: {minutes:02d}:{seconds:02d}", end="")
                 time.sleep(1)
             
-            print("\n")  # 倒计时结束后的换行
+            print("\n")
             cycle_count += 1
             
         except KeyboardInterrupt:
@@ -863,14 +927,13 @@ def cycle_swap(private_keys):
             print(f"\n第 {cycle_count} 个兑换周期完成")
             print("等待10分钟后开始下一个周期...")
             
-            # 倒计时
-            for i in range(600, 0, -1):  # 600秒 = 10分钟
+            for i in range(600, 0, -1):
                 minutes = i // 60
                 seconds = i % 60
                 print(f"\r下一个兑换周期开始的时间: {minutes:02d}:{seconds:02d}", end="")
                 time.sleep(1)
             
-            print("\n")  # 倒计时结束后的换行
+            print("\n")
             cycle_count += 1
             
         except KeyboardInterrupt:
@@ -888,16 +951,12 @@ def send_ini_to_self(private_keys):
             bot = IniChainBot(private_key)
             account_info = f"账户 {i} | {bot.address[-4:]}"
             
-            # 获取当前余额
             balance = w3.eth.get_balance(bot.address)
             formatted_balance = w3.from_wei(balance, 'ether')
             
-            # 计算安全Gas费用
             gas_price = bot.get_gas_price()
-            estimated_gas = 21000  # 转账的标准Gas
+            estimated_gas = 21000
             gas_cost = gas_price * estimated_gas
-            
-            # 计算安全余额（余额 - Gas费用）
             safe_balance = balance - gas_cost
             
             if safe_balance <= 0:
@@ -906,7 +965,6 @@ def send_ini_to_self(private_keys):
                 print(f"[{account_info}] 估算Gas费用: {w3.from_wei(gas_cost, 'ether'):.6f} INI")
                 continue
             
-            # 计算随机金额，介于余额的3-5%
             percentage = random.uniform(0.03, 0.05)
             amount_to_send = int(safe_balance * percentage)
             
@@ -919,7 +977,6 @@ def send_ini_to_self(private_keys):
             print(f"[{account_info}] 转账金额: {w3.from_wei(amount_to_send, 'ether'):.6f} INI ({percentage*100:.2f}%)")
             print(f"[{account_info}] Gas价格: {w3.from_wei(gas_price, 'gwei'):.2f} Gwei")
             
-            # 构建交易
             transaction = {
                 'from': bot.address,
                 'to': bot.address,
@@ -930,11 +987,9 @@ def send_ini_to_self(private_keys):
                 'chainId': CHAIN_ID
             }
             
-            # 签名并发送交易
             signed_txn = w3.eth.account.sign_transaction(transaction, bot.account.key)
             tx_hash = w3.eth.send_raw_transaction(signed_txn.rawTransaction)
             
-            # 等待交易回执
             receipt = bot.wait_for_transaction(tx_hash)
             
             if receipt and receipt['status'] == 1:
@@ -946,11 +1001,9 @@ def send_ini_to_self(private_keys):
         except Exception as e:
             print(f"[{account_info}] 出错: {str(e)}")
         
-        # 账户之间的延迟
         time.sleep(5)
 
 def main():
-    # 加载私钥
     try:
         with open("privatekey.txt", "r") as f:
             private_keys = [line.strip() for line in f.readlines() if line.strip()]
@@ -968,7 +1021,6 @@ def main():
         elif choice == "3":
             cycle_swap(private_keys)
         elif choice == "4":
-            # 创建代币菜单
             print("\n=== 创建代币 ===")
             name = input("代币全名: ")
             symbol = input("代币简称: ")
@@ -979,7 +1031,6 @@ def main():
                 print("错误: 代币数量或小数位数输入无效!")
                 continue
                 
-            # 为每个私钥处理创建代币
             for i, private_key in enumerate(private_keys, 1):
                 bot = IniChainBot(private_key)
                 account_info = f"账户 #{i}"
